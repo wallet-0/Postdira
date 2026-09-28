@@ -227,7 +227,7 @@ function isOwnUploadKey(key, userId) {
   return typeof key === 'string' && UPLOAD_KEY_REGEX.test(key) && key.startsWith('uploads/' + userId + '/');
 }
 
-const MONTHLY_PRICE_KOBO = 500000; // NGN 5,000/mo for unlimited posters — adjust to taste
+const MONTHLY_PRICE_KOBO = 200000; // NGN 2000/mo for unlimited posters — adjust to taste
 
 // ==================== INPUT VALIDATION: LENGTH CAPS & CHARACTER RULES ====================
 const NAME_MAX_LENGTH = 80;
