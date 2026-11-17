@@ -227,7 +227,7 @@ function isOwnUploadKey(key, userId) {
   return typeof key === 'string' && UPLOAD_KEY_REGEX.test(key) && key.startsWith('uploads/' + userId + '/');
 }
 
-const MONTHLY_PRICE_KOBO = 200000; // NGN 2000/mo for unlimited posters — adjust to taste
+const MONTHLY_PRICE_KOBO = 200000; // NGN 5,000/mo for unlimited posters — adjust to taste
 
 // ==================== INPUT VALIDATION: LENGTH CAPS & CHARACTER RULES ====================
 const NAME_MAX_LENGTH = 80;
@@ -1648,6 +1648,163 @@ app.get('/generate', authenticateToken, async function (req, res) {
   }
 });
 
+// ==================== TALKING HOST VIDEO (self-contained, isolated from posters) ====================
+// Adds /api/video/* only. It has its own collections, counters, device lock, IP caps and rate limiter,
+// and never reads or writes poster data (PosterDaily, IpDaily, DeviceBinding, adminSettingsCache, /generate).
+// Every handler is wrapped so a video failure can never crash the process or touch poster requests.
+// Env (all optional): VIDEO_FREE_CLEAN=2  VIDEO_FREE_WATERMARKED=3  VIDEO_FREE_AVATARS=Sam,Omar,Zuri
+//   VIDEO_WATERMARK_TEXT="Made with Postira"  VIDEO_IP_MULTIPLIER=3  VIDEO_ENCODER_PATH=...
+// Needs the mp4-muxer build: `npm i mp4-muxer@5.1.3`, or put it at ./private/mp4-muxer.js
+(function registerVideoRoutes() {
+  const videoFs = require('fs');
+  const videoPath = require('path');
+
+  const FREE_CLEAN = parseInt(process.env.VIDEO_FREE_CLEAN || '2', 10);       // first N downloads: no watermark
+  const FREE_WM = parseInt(process.env.VIDEO_FREE_WATERMARKED || '3', 10);    // next N: watermarked
+  const FREE_TOTAL = FREE_CLEAN + FREE_WM;
+  const FREE_AVATARS = (process.env.VIDEO_FREE_AVATARS || 'Sam,Omar,Zuri').split(',').map(function (s) { return s.trim().toLowerCase(); }).filter(Boolean);
+  const WM_TEXT = process.env.VIDEO_WATERMARK_TEXT || 'Made with Postira';
+  const IP_MULT = parseInt(process.env.VIDEO_IP_MULTIPLIER || '3', 10) || 3;
+  const MAX_REFUNDS = 3; // per user per day, only for failed renders
+
+  // The encoder is never public: sent only against a one-time grant.
+  let encoderCode = null;
+  function loadEncoder() {
+    if (encoderCode) return encoderCode;
+    const cands = [process.env.VIDEO_ENCODER_PATH, videoPath.join(__dirname, 'private', 'mp4-muxer.js')];
+    try { cands.push(videoPath.join(videoPath.dirname(require.resolve('mp4-muxer')), 'mp4-muxer.js')); } catch (e) { /* not installed */ }
+    for (const p of cands) {
+      if (!p) continue;
+      try { const c = videoFs.readFileSync(p, 'utf8'); if (c.includes('Mp4Muxer')) return (encoderCode = c); } catch (e) { /* try next */ }
+    }
+    return null;
+  }
+  if (!loadEncoder()) console.warn('WARNING: mp4-muxer build not found — video downloads will fail (posters are unaffected). Run "npm i mp4-muxer@5.1.3" or set VIDEO_ENCODER_PATH.');
+
+  const VideoDaily = mongoose.model('VideoDaily', new mongoose.Schema({
+    key: { type: String, required: true }, date: { type: String, required: true }, count: { type: Number, default: 0 }
+  }, { timestamps: true }).index({ key: 1, date: 1 }, { unique: true }));
+
+  // Separate from the poster app's DeviceBinding on purpose: a video lock must never block poster generation.
+  const VideoDeviceBinding = mongoose.model('VideoDeviceBinding', new mongoose.Schema({
+    fingerprint: { type: String, required: true, unique: true }, userId: { type: String, required: true }
+  }, { timestamps: true }));
+
+  const VideoGrant = mongoose.model('VideoGrant', new mongoose.Schema({
+    gid: { type: String, required: true, unique: true }, userId: String, date: String,
+    free: Boolean, watermark: Boolean, hd: Boolean, ipKey: String,
+    used: { type: Boolean, default: false }, refunded: { type: Boolean, default: false },
+    createdAt: { type: Date, default: Date.now, expires: 3600 }
+  }));
+
+  // Atomic "take one slot if under the limit"; null when full.
+  async function takeSlot(key, limit, date) {
+    try {
+      const r = await VideoDaily.findOneAndUpdate(
+        { key: key, date: date, count: { $lt: limit } }, { $inc: { count: 1 } }, { upsert: true, new: true });
+      return r.count;
+    } catch (e) { if (e.code === 11000) return null; throw e; }
+  }
+  function giveBack(key, date) {
+    return VideoDaily.updateOne({ key: key, date: date, count: { $gt: 0 } }, { $inc: { count: -1 } });
+  }
+  function bindVideoDevice(fingerprint, userId) {
+    return VideoDeviceBinding.findOneAndUpdate(
+      { fingerprint: fingerprint }, { $setOnInsert: { fingerprint: fingerprint, userId: userId } }, { upsert: true, new: true });
+  }
+  // Wraps async handlers: any error becomes a 500 for the video request only.
+  function safe(fn) {
+    return function (req, res, next) {
+      Promise.resolve(fn(req, res, next)).catch(function (err) {
+        console.error('[video] ' + req.path + ' error:', err.message);
+        if (!res.headersSent) res.status(500).json({ error: 'Video service error. Please try again.' });
+      });
+    };
+  }
+
+  const videoLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000, max: 60, message: { error: 'Too many requests. Please slow down.' },
+    keyGenerator: function (req) { return req.user ? req.user.id : getClientIp(req); }
+  });
+
+  app.get('/api/video/status', authenticateToken, videoLimiter, safe(async function (req, res) {
+    const u = req.user, paid = hasActiveSubscription(u), date = getTodayDateString();
+    const out = { subscribed: paid, name: u.fullName, endDate: paid ? u.subscriptionEndDate : null,
+                  watermarkText: WM_TEXT, tag: u.id.slice(0, 6), freeAvatars: paid ? null : FREE_AVATARS };
+    if (!paid) {
+      const rec = await VideoDaily.findOne({ key: 'user:' + u.id, date: date });
+      const used = rec ? rec.count : 0;
+      out.cleanLeft = Math.max(0, FREE_CLEAN - used);
+      out.watermarkedLeft = Math.max(0, FREE_WM - Math.max(0, used - FREE_CLEAN));
+      const fp = getClientFingerprint(req);
+      if (fp) {
+        const b = await VideoDeviceBinding.findOne({ fingerprint: fp });
+        out.deviceBlocked = !!b && b.userId !== u.id;
+      }
+    }
+    res.json(out);
+  }));
+
+  app.post('/api/video/authorize', authenticateToken, videoLimiter, safe(async function (req, res) {
+    const u = req.user, paid = hasActiveSubscription(u), date = getTodayDateString();
+    const avatar = String(req.body.avatar || '').slice(0, 40).trim().toLowerCase();
+    const fail = function (status, code, error) { return res.status(status).json({ code: code, error: error }); };
+    let watermark = false, ipKey = null;
+
+    if (!paid) {
+      if (!FREE_AVATARS.includes(avatar)) return fail(402, 'avatar_locked', 'This presenter is on the unlimited plan.');
+      if (req.body.quality === 'hd') return fail(402, 'hd_locked', 'HD is on the unlimited plan.');
+
+      const fp = getClientFingerprint(req);
+      if (!fp) return fail(400, 'fingerprint_required', 'We couldn’t verify this device. Open the page over HTTPS and try again.');
+      const binding = await bindVideoDevice(fp, u.id);
+      if (binding.userId !== u.id) return fail(403, 'device', 'This device is already used by another free account. Go unlimited to use it with this one.');
+
+      const ip = getClientIp(req);
+      if (ip) {
+        ipKey = 'ip:' + ip;
+        if (!(await takeSlot(ipKey, FREE_TOTAL * IP_MULT, date)))
+          return fail(403, 'limit_ip', 'Today’s free limit for this network is used up. Go unlimited to keep creating.');
+      }
+      const n = await takeSlot('user:' + u.id, FREE_TOTAL, date);
+      if (!n) {
+        if (ipKey) await giveBack(ipKey, date);
+        return fail(403, 'limit', 'You’ve used all of today’s free videos. Go unlimited to keep downloading.');
+      }
+      watermark = n > FREE_CLEAN; // first FREE_CLEAN are clean, the rest watermarked
+    }
+
+    const gid = crypto.randomUUID();
+    await VideoGrant.create({ gid: gid, userId: u.id, date: date, free: !paid, watermark: watermark, hd: paid, ipKey: ipKey });
+    res.json({ grantId: gid, watermark: watermark, hd: paid, watermarkText: WM_TEXT, tag: u.id.slice(0, 6) });
+  }));
+
+  // One grant = one encoder download. No grant, no MP4.
+  app.get('/api/video/encoder', authenticateToken, videoLimiter, safe(async function (req, res) {
+    const g = await VideoGrant.findOneAndUpdate(
+      { gid: String(req.query.grant || ''), userId: req.user.id, used: false, refunded: false,
+        createdAt: { $gt: new Date(Date.now() - 10 * 60 * 1000) } },
+      { used: true });
+    if (!g) return res.status(403).json({ code: 'grant', error: 'That download has expired. Press Download again.' });
+    const code = loadEncoder();
+    if (!code) return res.status(503).json({ code: 'encoder', error: 'The video tool is unavailable right now.' });
+    res.set({ 'Content-Type': 'application/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.send(code);
+  }));
+
+  // Gives the slot back when a render FAILS (not when the user cancels). Capped per day.
+  app.post('/api/video/refund', authenticateToken, videoLimiter, safe(async function (req, res) {
+    const g = await VideoGrant.findOneAndUpdate(
+      { gid: String(req.body.grantId || ''), userId: req.user.id, free: true, refunded: false,
+        createdAt: { $gt: new Date(Date.now() - 20 * 60 * 1000) } },
+      { refunded: true });
+    if (!g || !(await takeSlot('refund:' + req.user.id, MAX_REFUNDS, g.date))) return res.json({ refunded: false });
+    await giveBack('user:' + req.user.id, g.date);
+    if (g.ipKey) await giveBack(g.ipKey, g.date);
+    res.json({ refunded: true });
+  }));
+})();
+
 // ==================== ROOT (API-only — frontend lives in another repo) ====================
 app.get('/', function (req, res) {
   res.json({
@@ -1659,6 +1816,7 @@ app.get('/', function (req, res) {
       uploads: 'POST /api/uploads/presign { contentType }',
       subscription: ['GET /api/subscription/status', 'POST /api/subscription/initiate'],
       admin: 'GET|POST /admin-limits',
+      video: ['GET /api/video/status', 'POST /api/video/authorize', 'GET /api/video/encoder?grant=', 'POST /api/video/refund'],
       health: 'GET /ping'
     }
   });
